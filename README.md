@@ -1,4 +1,4 @@
-# 🔍 InspectAI - Industrial Defect Detection System
+# InspectAI - Industrial Defect Detection System
 
 
 
