@@ -1,9 +1,6 @@
 # 🔍 InspectAI - Industrial Defect Detection System
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 
 A production-ready deep learning system for industrial defect detection using computer vision. Built with PyTorch and deployed as a FastAPI REST API with a modern web interface.
 
