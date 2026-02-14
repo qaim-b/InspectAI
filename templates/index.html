@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InspectAI Console</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="noise"></div>
+
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">Industrial Vision Intelligence</p>
+            <h1>InspectAI Console</h1>
+        </div>
+        <div class="topbar-right">
+            <label>
+                Decision Threshold
+                <input id="threshold" type="range" min="0.05" max="0.95" step="0.05" value="0.5">
+                <span id="thresholdValue">0.50</span>
+            </label>
+            <button id="refreshHistoryBtn" class="btn ghost">Refresh History</button>
+        </div>
+    </header>
+
+    <main class="layout">
+        <section class="panel hero">
+            <h2>Beyond Accuracy: Risk-Aware Defect Intelligence</h2>
+            <p>Track uncertainty, quality score, drift state, and actionable risk bands to support real manufacturing decisions.</p>
+            <div class="hero-kpis">
+                <article><span id="kpiDefectRate">0%</span><p>Defect Rate</p></article>
+                <article><span id="kpiLatency">0 ms</span><p>Avg Inference</p></article>
+                <article><span id="kpiRisk">0</span><p>Critical Risk Alerts</p></article>
+                <article><span id="kpiMode">-</span><p>Runtime Mode</p></article>
+            </div>
+        </section>
+
+        <section class="panel control">
+            <h3>Run Inference</h3>
+            <div id="dropzone" class="dropzone">
+                <input id="fileInput" type="file" accept="image/*" multiple hidden>
+                <p>Select one or multiple images</p>
+                <small id="fileHint">No files selected</small>
+            </div>
+            <div class="actions">
+                <button id="singleBtn" class="btn primary" disabled>Analyze Single</button>
+                <button id="batchBtn" class="btn secondary" disabled>Analyze Batch</button>
+                <button id="exportBtn" class="btn danger" disabled>Export Result JSON</button>
+            </div>
+            <p id="status" class="status"></p>
+        </section>
+
+        <section class="panel result">
+            <h3>Latest Result</h3>
+            <div class="result-grid">
+                <article><span>Class</span><strong id="resClass">-</strong></article>
+                <article><span>Confidence</span><strong id="resConfidence">-</strong></article>
+                <article><span>Entropy</span><strong id="resEntropy">-</strong></article>
+                <article><span>Margin</span><strong id="resMargin">-</strong></article>
+                <article><span>Risk Band</span><strong id="resRiskBand">-</strong></article>
+                <article><span>Drift</span><strong id="resDrift">-</strong></article>
+            </div>
+            <div class="prob-wrap">
+                <h4>Probability Split</h4>
+                <div class="bar-row"><span>Good</span><div class="bar-bg"><div id="goodBar" class="bar good"></div></div><span id="goodText">0%</span></div>
+                <div class="bar-row"><span>Defect</span><div class="bar-bg"><div id="defectBar" class="bar defect"></div></div><span id="defectText">0%</span></div>
+            </div>
+            <div class="quality-grid">
+                <h4>Input Quality Diagnostics</h4>
+                <div><span>Sharpness</span><strong id="qSharpness">-</strong></div>
+                <div><span>Brightness</span><strong id="qBrightness">-</strong></div>
+                <div><span>Contrast</span><strong id="qContrast">-</strong></div>
+                <div><span>Saturation</span><strong id="qSaturation">-</strong></div>
+                <div><span>Quality Score</span><strong id="qScore">-</strong></div>
+                <div><span>Inference</span><strong id="qLatency">-</strong></div>
+            </div>
+        </section>
+
+        <section class="panel history">
+            <h3>Inference Timeline</h3>
+            <canvas id="historyCanvas" width="900" height="240"></canvas>
+            <div id="historyMeta" class="history-meta"></div>
+        </section>
+    </main>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

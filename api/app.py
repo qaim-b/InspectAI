@@ -1,36 +1,105 @@
 """
-FastAPI application for InspectAI defect detection
-Real-time inference API
+InspectAI FastAPI application
+Industrial defect intelligence with advanced inference analytics.
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-import uvicorn
-from PIL import Image
-import io
-import base64
-import numpy as np
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional
+import io
+import math
+import statistics
+import time
+
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from PIL import Image
+from pydantic import BaseModel
+
 import sys
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent / 'src'))
-
-from inference import DefectPredictor
+# Add src to import path
+sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 
-# Initialize FastAPI app
+APP_VERSION = "2.0.0"
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+INFERENCE_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=300)
+
+
+class PredictionResponse(BaseModel):
+    class_id: int
+    class_name: str
+    confidence: float
+    probabilities: Dict[str, float]
+    message: str
+    inference_ms: float
+    decision_threshold: float
+    predicted_defect: bool
+    uncertainty_entropy: float
+    confidence_margin: float
+    quality: Dict[str, float]
+    risk: Dict[str, Any]
+    drift: Dict[str, Any]
+    timestamp: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    model_loaded: bool
+    mode: str
+    model_info: Optional[Dict[str, Any]] = None
+
+
+class MockPredictor:
+    """Fallback predictor for environments without model checkpoint."""
+
+    class_names = ["Good", "Defect"]
+
+    def __init__(self) -> None:
+        self.device = "cpu-mock"
+        self.img_size = 224
+
+    def predict(self, image: Image.Image) -> Dict[str, Any]:
+        arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+        gray = arr.mean(axis=2)
+        brightness = float(gray.mean() / 255.0)
+        contrast = float(gray.std() / 64.0)
+        edge_score = float(np.mean(np.abs(np.diff(gray, axis=0))) / 32.0)
+
+        defect_prob = max(0.02, min(0.98, 0.16 + (contrast * 0.38) + (edge_score * 0.42) - (brightness * 0.14)))
+        good_prob = 1.0 - defect_prob
+        class_id = 1 if defect_prob >= good_prob else 0
+        confidence = defect_prob if class_id == 1 else good_prob
+
+        return {
+            "class": class_id,
+            "label": self.class_names[class_id],
+            "confidence": float(confidence),
+            "probabilities": {"Good": float(good_prob), "Defect": float(defect_prob)},
+        }
+
+    def get_model_info(self) -> Dict[str, Any]:
+        return {
+            "device": self.device,
+            "parameters": 0,
+            "classes": self.class_names,
+            "input_size": self.img_size,
+            "mode": "mock",
+        }
+
+
 app = FastAPI(
-    title="InspectAI - Defect Detection API",
-    description="Industrial defect detection using deep learning",
-    version="1.0.0"
+    title="InspectAI - Defect Intelligence API",
+    description="Industrial defect detection with advanced analytics and monitoring.",
+    version=APP_VERSION,
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,544 +108,328 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
-static_dir = Path(__file__).parent.parent / "static"
+base_dir = Path(__file__).parent.parent
+static_dir = base_dir / "static"
+templates_dir = base_dir / "templates"
 static_dir.mkdir(exist_ok=True)
+templates_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+templates = Jinja2Templates(directory=str(templates_dir))
 
-# Global predictor instance
-predictor = None
-
-
-def load_model(model_path: str = "models/checkpoints/best_acc.pth"):
-    """Load the trained model"""
-    global predictor
-    try:
-        predictor = DefectPredictor(model_path, device='cuda')
-        print("Model loaded successfully!")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Using dummy predictor for demo...")
-        predictor = None
+predictor: Optional[Any] = None
+predictor_mode = "mock"
 
 
-# Response models
-class PredictionResponse(BaseModel):
-    """Response model for predictions"""
-    class_id: int
-    class_name: str
-    confidence: float
-    probabilities: dict
-    message: str
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str
-    model_loaded: bool
-    model_info: Optional[dict] = None
+def compute_quality_metrics(image: Image.Image) -> Dict[str, float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    gray = arr.mean(axis=2)
+    laplacian_var = float(np.var(np.diff(gray, axis=0))) if gray.shape[0] > 1 else 0.0
+    brightness = float(gray.mean() / 255.0)
+    contrast = float(gray.std() / 128.0)
+    saturation = float(np.std(arr, axis=2).mean() / 128.0)
+
+    quality_score = max(
+        0.0,
+        min(1.0, (0.36 * min(laplacian_var / 1000.0, 1.0)) + (0.26 * min(contrast, 1.0)) + (0.22 * min(saturation, 1.0)) + (0.16 * (1.0 - abs(0.5 - brightness)))),
+    )
+
+    return {
+        "sharpness": round(min(laplacian_var / 1000.0, 1.0), 4),
+        "brightness": round(brightness, 4),
+        "contrast": round(min(contrast, 1.0), 4),
+        "saturation": round(min(saturation, 1.0), 4),
+        "quality_score": round(quality_score, 4),
+    }
+
+
+def entropy_from_probs(probabilities: Dict[str, float]) -> float:
+    values = [max(1e-8, float(v)) for v in probabilities.values()]
+    total = sum(values) or 1.0
+    normed = [v / total for v in values]
+    return float(-sum(p * math.log(p, 2) for p in normed))
+
+
+def infer_risk(probabilities: Dict[str, float], quality: Dict[str, float], decision_threshold: float) -> Dict[str, Any]:
+    defect_prob = float(probabilities.get("Defect", 0.0))
+    confidence_margin = abs(float(probabilities.get("Good", 0.0)) - defect_prob)
+    uncertainty = entropy_from_probs(probabilities)
+    quality_penalty = 1.0 - float(quality.get("quality_score", 0.0))
+
+    risk_score = min(1.0, max(0.0, (0.55 * defect_prob) + (0.2 * uncertainty) + (0.25 * quality_penalty)))
+    if risk_score >= 0.72:
+        band = "critical"
+        action = "quarantine_item_and_manual_review"
+    elif risk_score >= 0.44:
+        band = "warning"
+        action = "secondary_inspection"
+    else:
+        band = "stable"
+        action = "allow_pass"
+
+    if defect_prob >= decision_threshold and band == "stable":
+        band = "warning"
+        action = "secondary_inspection"
+
+    return {
+        "risk_score": round(risk_score, 4),
+        "risk_band": band,
+        "recommended_action": action,
+        "confidence_margin": round(confidence_margin, 4),
+        "uncertainty_entropy": round(uncertainty, 4),
+    }
+
+
+def compute_drift_signal(current_confidence: float) -> Dict[str, Any]:
+    if len(INFERENCE_HISTORY) < 8:
+        return {"drift_score": 0.0, "drift_state": "insufficient_history", "baseline_confidence": 0.0}
+
+    baseline = [float(x["confidence"]) for x in INFERENCE_HISTORY]
+    baseline_mean = statistics.fmean(baseline)
+    baseline_std = statistics.pstdev(baseline) or 1e-6
+    z = abs((current_confidence - baseline_mean) / baseline_std)
+    drift_score = min(1.0, z / 3.0)
+    if drift_score >= 0.75:
+        state = "high_shift"
+    elif drift_score >= 0.4:
+        state = "moderate_shift"
+    else:
+        state = "stable"
+    return {
+        "drift_score": round(drift_score, 4),
+        "drift_state": state,
+        "baseline_confidence": round(baseline_mean, 4),
+    }
+
+
+def summarize_history(limit: int = 100) -> Dict[str, Any]:
+    rows = list(INFERENCE_HISTORY)[-limit:]
+    if not rows:
+        return {
+            "total": 0,
+            "defect_rate": 0.0,
+            "avg_confidence": 0.0,
+            "avg_latency_ms": 0.0,
+            "risk_distribution": {"stable": 0, "warning": 0, "critical": 0},
+        }
+
+    total = len(rows)
+    defect_rate = sum(1 for r in rows if r["class_name"] == "Defect") / total
+    avg_conf = statistics.fmean(float(r["confidence"]) for r in rows)
+    avg_latency = statistics.fmean(float(r["inference_ms"]) for r in rows)
+    risk_distribution = {"stable": 0, "warning": 0, "critical": 0}
+    for row in rows:
+        band = str(row["risk"]["risk_band"])
+        risk_distribution[band] = risk_distribution.get(band, 0) + 1
+
+    return {
+        "total": total,
+        "defect_rate": round(defect_rate, 4),
+        "avg_confidence": round(avg_conf, 4),
+        "avg_latency_ms": round(avg_latency, 2),
+        "risk_distribution": risk_distribution,
+    }
+
+
+def load_model(model_path: str = "models/checkpoints/best_acc.pth") -> None:
+    global predictor, predictor_mode
+    model_file = Path(model_path)
+    if model_file.exists():
+        try:
+            from inference import DefectPredictor  # lazy import for serverless compatibility
+            predictor = DefectPredictor(str(model_file), device="cuda")
+            predictor_mode = "trained"
+            return
+        except Exception:
+            pass
+    predictor = MockPredictor()
+    predictor_mode = "mock"
 
 
 @app.on_event("startup")
-async def startup_event():
-    """Initialize model on startup"""
-    model_path = Path("models/checkpoints/best_acc.pth")
-    if model_path.exists():
-        load_model(str(model_path))
-    else:
-        print("No trained model found. Please train a model first.")
+async def startup_event() -> None:
+    load_model()
 
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    """Serve the home page"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>InspectAI - Industrial Defect Detection</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * { 
-                margin: 0; 
-                padding: 0; 
-                box-sizing: border-box; 
-            }
-            
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                background: #f5f7fa;
-                min-height: 100vh;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                padding: 20px;
-                color: #2d3748;
-            }
-            
-            .container {
-                background: white;
-                border-radius: 16px;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05), 0 10px 15px rgba(0, 0, 0, 0.1);
-                padding: 48px;
-                max-width: 720px;
-                width: 100%;
-            }
-            
-            .header {
-                text-align: center;
-                margin-bottom: 40px;
-                border-bottom: 1px solid #e2e8f0;
-                padding-bottom: 24px;
-            }
-            
-            h1 {
-                color: #1a202c;
-                margin-bottom: 8px;
-                font-size: 28px;
-                font-weight: 600;
-                letter-spacing: -0.5px;
-            }
-            
-            .subtitle {
-                color: #718096;
-                font-size: 14px;
-                font-weight: 400;
-            }
-            
-            .upload-area {
-                border: 2px dashed #cbd5e0;
-                border-radius: 12px;
-                padding: 48px 24px;
-                text-align: center;
-                cursor: pointer;
-                transition: all 0.2s ease;
-                background: #f7fafc;
-            }
-            
-            .upload-area:hover {
-                background: #edf2f7;
-                border-color: #4299e1;
-            }
-            
-            .upload-icon {
-                font-size: 48px;
-                margin-bottom: 16px;
-                color: #a0aec0;
-            }
-            
-            .upload-text {
-                color: #4a5568;
-                font-size: 16px;
-                margin-bottom: 8px;
-                font-weight: 500;
-            }
-            
-            .upload-hint {
-                color: #a0aec0;
-                font-size: 13px;
-            }
-            
-            input[type="file"] {
-                display: none;
-            }
-            
-            .btn {
-                background: #2b6cb0;
-                color: white;
-                border: none;
-                padding: 12px 32px;
-                border-radius: 8px;
-                font-size: 15px;
-                font-weight: 500;
-                cursor: pointer;
-                transition: all 0.2s ease;
-                margin-top: 24px;
-                width: 100%;
-            }
-            
-            .btn:hover:not(:disabled) {
-                background: #2c5282;
-                transform: translateY(-1px);
-                box-shadow: 0 4px 12px rgba(43, 108, 176, 0.4);
-            }
-            
-            .btn:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
-            
-            #preview {
-                margin: 24px 0;
-                text-align: center;
-            }
-            
-            #preview img {
-                max-width: 100%;
-                max-height: 360px;
-                border-radius: 8px;
-                border: 1px solid #e2e8f0;
-            }
-            
-            #result {
-                margin-top: 32px;
-                padding: 24px;
-                border-radius: 12px;
-                display: none;
-                border: 2px solid;
-            }
-            
-            .result-good {
-                background: #f0fdf4;
-                border-color: #22c55e;
-            }
-            
-            .result-defect {
-                background: #fef2f2;
-                border-color: #ef4444;
-            }
-            
-            .result-header {
-                display: flex;
-                align-items: center;
-                margin-bottom: 16px;
-            }
-            
-            .result-icon {
-                font-size: 24px;
-                margin-right: 12px;
-            }
-            
-            .result-title {
-                font-size: 20px;
-                font-weight: 600;
-                color: #1a202c;
-            }
-            
-            .confidence {
-                font-size: 15px;
-                margin: 12px 0;
-                color: #4a5568;
-            }
-            
-            .confidence-value {
-                font-weight: 600;
-                font-size: 18px;
-            }
-            
-            .probabilities {
-                margin-top: 20px;
-            }
-            
-            .prob-bar {
-                margin: 16px 0;
-            }
-            
-            .prob-label {
-                display: flex;
-                justify-content: space-between;
-                margin-bottom: 8px;
-                font-size: 14px;
-                color: #4a5568;
-            }
-            
-            .prob-label-name {
-                font-weight: 500;
-            }
-            
-            .prob-label-value {
-                font-weight: 600;
-                color: #2d3748;
-            }
-            
-            .bar-container {
-                background: #e2e8f0;
-                height: 8px;
-                border-radius: 4px;
-                overflow: hidden;
-            }
-            
-            .bar {
-                height: 100%;
-                border-radius: 4px;
-                transition: width 0.6s ease;
-            }
-            
-            .bar-good {
-                background: #22c55e;
-            }
-            
-            .bar-defect {
-                background: #ef4444;
-            }
-            
-            .loader {
-                border: 3px solid #e2e8f0;
-                border-top: 3px solid #2b6cb0;
-                border-radius: 50%;
-                width: 40px;
-                height: 40px;
-                animation: spin 0.8s linear infinite;
-                margin: 20px auto;
-                display: none;
-            }
-            
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>InspectAI</h1>
-                <p class="subtitle">AI-Powered Industrial Defect Detection</p>
-            </div>
-            
-            <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                <div class="upload-icon">📁</div>
-                <p class="upload-text">Click to upload or drag & drop</p>
-                <p class="upload-hint">Supported: JPG, PNG, BMP</p>
-            </div>
-            
-            <input type="file" id="fileInput" accept="image/*" onchange="handleFileSelect(event)">
-            
-            <div id="preview"></div>
-            
-            <div style="text-align: center;">
-                <button class="btn" id="predictBtn" onclick="predict()" disabled>
-                    Analyze Image
-                </button>
-            </div>
-            
-            <div class="loader" id="loader"></div>
-            
-            <div id="result"></div>
-        </div>
-
-        <script>
-            let selectedFile = null;
-
-            function handleFileSelect(event) {
-                const file = event.target.files[0];
-                if (file) {
-                    selectedFile = file;
-                    const reader = new FileReader();
-                    reader.onload = function(e) {
-                        document.getElementById('preview').innerHTML = 
-                            '<img src="' + e.target.result + '" alt="Preview">';
-                        document.getElementById('predictBtn').disabled = false;
-                        document.getElementById('result').style.display = 'none';
-                    };
-                    reader.readAsDataURL(file);
-                }
-            }
-
-            async function predict() {
-                if (!selectedFile) return;
-
-                const formData = new FormData();
-                formData.append('file', selectedFile);
-
-                document.getElementById('predictBtn').disabled = true;
-                document.getElementById('loader').style.display = 'block';
-                document.getElementById('result').style.display = 'none';
-
-                try {
-                    const response = await fetch('/predict', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        displayResult(data);
-                    } else {
-                        alert('Error: ' + data.detail);
-                    }
-                } catch (error) {
-                    alert('Error making prediction: ' + error);
-                } finally {
-                    document.getElementById('predictBtn').disabled = false;
-                    document.getElementById('loader').style.display = 'none';
-                }
-            }
-
-            function displayResult(data) {
-                const resultDiv = document.getElementById('result');
-                const isGood = data.class_name === 'Good';
-                
-                resultDiv.className = isGood ? 'result-good' : 'result-defect';
-                
-                const goodProb = data.probabilities['Good'];
-                const defectProb = data.probabilities['Defect'];
-                
-                resultDiv.innerHTML = `
-                    <div class="result-header">
-                        <span class="result-icon">${isGood ? '✓' : '✕'}</span>
-                        <span class="result-title">${data.class_name}</span>
-                    </div>
-                    <div class="confidence">
-                        Confidence: <span class="confidence-value">${(data.confidence * 100).toFixed(1)}%</span>
-                    </div>
-                    <div class="probabilities">
-                        <div class="prob-bar">
-                            <div class="prob-label">
-                                <span class="prob-label-name">Good</span>
-                                <span class="prob-label-value">${(goodProb * 100).toFixed(1)}%</span>
-                            </div>
-                            <div class="bar-container">
-                                <div class="bar bar-good" style="width: ${goodProb * 100}%;"></div>
-                            </div>
-                        </div>
-                        <div class="prob-bar">
-                            <div class="prob-label">
-                                <span class="prob-label-name">Defect</span>
-                                <span class="prob-label-value">${(defectProb * 100).toFixed(1)}%</span>
-                            </div>
-                            <div class="bar-container">
-                                <div class="bar bar-defect" style="width: ${defectProb * 100}%;"></div>
-                            </div>
-                        </div>
-                    </div>
-                `;
-                
-                resultDiv.style.display = 'block';
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+@app.get("/")
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
+async def health_check() -> HealthResponse:
     model_loaded = predictor is not None
-    model_info = predictor.get_model_info() if model_loaded else None
-    
+    model_info = predictor.get_model_info() if model_loaded and hasattr(predictor, "get_model_info") else None
     return HealthResponse(
-        status="healthy" if model_loaded else "model_not_loaded",
+        status="healthy" if model_loaded else "degraded",
         model_loaded=model_loaded,
-        model_info=model_info
+        mode=predictor_mode,
+        model_info=model_info,
     )
 
 
+@app.get("/analytics/history")
+async def analytics_history(limit: int = Query(default=30, ge=1, le=300)):
+    rows = list(INFERENCE_HISTORY)[-limit:]
+    return {"history": rows, "summary": summarize_history(limit)}
+
+
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_defect(file: UploadFile = File(...)):
-    """
-    Predict defect from uploaded image
-    
-    Args:
-        file: Image file
-    
-    Returns:
-        Prediction results
-    """
+async def predict_defect(
+    file: UploadFile = File(...),
+    decision_threshold: float = Query(default=0.5, ge=0.05, le=0.95),
+):
     if predictor is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Please train a model first."
-        )
-    
-    # Validate file type
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(
-            status_code=400,
-            detail="File must be an image"
-        )
-    
+        raise HTTPException(status_code=503, detail="Predictor unavailable")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large")
+
     try:
-        # Read image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert('RGB')
-        
-        # Make prediction
-        result = predictor.predict(image)
-        
-        return PredictionResponse(
-            class_id=result['class'],
-            class_name=result['label'],
-            confidence=result['confidence'],
-            probabilities=result['probabilities'],
-            message="Prediction successful"
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing image: {str(e)}"
-        )
+        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+
+    start = time.perf_counter()
+    result = predictor.predict(image)
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    quality = compute_quality_metrics(image)
+    risk = infer_risk(result["probabilities"], quality, decision_threshold)
+    drift = compute_drift_signal(float(result["confidence"]))
+
+    record = {
+        "timestamp": now_iso(),
+        "filename": file.filename or "unknown",
+        "class_id": int(result["class"]),
+        "class_name": str(result["label"]),
+        "confidence": float(result["confidence"]),
+        "probabilities": result["probabilities"],
+        "inference_ms": round(latency_ms, 2),
+        "quality": quality,
+        "risk": risk,
+    }
+    INFERENCE_HISTORY.append(record)
+
+    defect_prob = float(result["probabilities"].get("Defect", 0.0))
+    predicted_defect = defect_prob >= decision_threshold
+
+    return PredictionResponse(
+        class_id=int(result["class"]),
+        class_name=str(result["label"]),
+        confidence=float(result["confidence"]),
+        probabilities={k: float(v) for k, v in result["probabilities"].items()},
+        message="Inference complete",
+        inference_ms=round(latency_ms, 2),
+        decision_threshold=decision_threshold,
+        predicted_defect=predicted_defect,
+        uncertainty_entropy=risk["uncertainty_entropy"],
+        confidence_margin=risk["confidence_margin"],
+        quality=quality,
+        risk=risk,
+        drift=drift,
+        timestamp=record["timestamp"],
+    )
 
 
 @app.post("/predict/batch")
-async def predict_batch(files: List[UploadFile] = File(...)):
-    """
-    Predict defects from multiple images
-    
-    Args:
-        files: List of image files
-    
-    Returns:
-        List of prediction results
-    """
+async def predict_batch(
+    files: List[UploadFile] = File(...),
+    decision_threshold: float = Query(default=0.5, ge=0.05, le=0.95),
+):
     if predictor is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded"
-        )
-    
-    results = []
-    
+        raise HTTPException(status_code=503, detail="Predictor unavailable")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    outputs: List[Dict[str, Any]] = []
     for file in files:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            outputs.append({"filename": file.filename, "error": "not_an_image"})
+            continue
+
+        raw_bytes = await file.read()
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            outputs.append({"filename": file.filename, "error": "file_too_large"})
+            continue
+
         try:
-            contents = await file.read()
-            image = Image.open(io.BytesIO(contents)).convert('RGB')
+            image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            start = time.perf_counter()
             result = predictor.predict(image)
-            results.append({
-                'filename': file.filename,
-                **result
-            })
-        except Exception as e:
-            results.append({
-                'filename': file.filename,
-                'error': str(e)
-            })
-    
-    return JSONResponse(content={'predictions': results})
+            latency_ms = (time.perf_counter() - start) * 1000
+            quality = compute_quality_metrics(image)
+            risk = infer_risk(result["probabilities"], quality, decision_threshold)
+            defect_prob = float(result["probabilities"].get("Defect", 0.0))
+
+            row = {
+                "timestamp": now_iso(),
+                "filename": file.filename or "unknown",
+                "class_id": int(result["class"]),
+                "class_name": str(result["label"]),
+                "confidence": float(result["confidence"]),
+                "probabilities": {k: float(v) for k, v in result["probabilities"].items()},
+                "inference_ms": round(latency_ms, 2),
+                "predicted_defect": defect_prob >= decision_threshold,
+                "quality_score": quality["quality_score"],
+                "risk_band": risk["risk_band"],
+                "risk_score": risk["risk_score"],
+            }
+            outputs.append(row)
+
+            INFERENCE_HISTORY.append(
+                {
+                    "timestamp": row["timestamp"],
+                    "filename": row["filename"],
+                    "class_id": row["class_id"],
+                    "class_name": row["class_name"],
+                    "confidence": row["confidence"],
+                    "probabilities": row["probabilities"],
+                    "inference_ms": row["inference_ms"],
+                    "quality": quality,
+                    "risk": risk,
+                }
+            )
+        except Exception as exc:
+            outputs.append({"filename": file.filename, "error": str(exc)})
+
+    valid_rows = [x for x in outputs if "error" not in x]
+    summary = {
+        "total_files": len(files),
+        "processed": len(valid_rows),
+        "failed": len(files) - len(valid_rows),
+        "defect_rate": round(sum(1 for x in valid_rows if x["predicted_defect"]) / max(len(valid_rows), 1), 4),
+        "avg_confidence": round(statistics.fmean(x["confidence"] for x in valid_rows), 4) if valid_rows else 0.0,
+        "avg_latency_ms": round(statistics.fmean(x["inference_ms"] for x in valid_rows), 2) if valid_rows else 0.0,
+        "critical_risk_count": sum(1 for x in valid_rows if x["risk_band"] == "critical"),
+    }
+    return JSONResponse(content={"predictions": outputs, "summary": summary})
 
 
-@app.get("/docs")
-async def get_docs():
-    """API documentation"""
+@app.get("/docs/meta")
+async def docs_meta():
     return {
+        "app": "InspectAI",
+        "version": APP_VERSION,
+        "mode": predictor_mode,
         "endpoints": {
-            "/": "Web interface",
-            "/health": "Health check",
-            "/predict": "Single image prediction",
-            "/predict/batch": "Batch prediction",
-            "/docs": "API documentation"
+            "GET /": "Web console",
+            "GET /health": "Service health + model mode",
+            "POST /predict": "Single image inference with analytics",
+            "POST /predict/batch": "Batch inference + summary",
+            "GET /analytics/history": "Recent inference history and KPI summary",
+            "GET /docs/meta": "API metadata",
         },
-        "usage": {
-            "predict": "POST image file to /predict",
-            "batch": "POST multiple image files to /predict/batch"
-        }
     }
 
 
 if __name__ == "__main__":
-    # Run the API
-    print("Starting InspectAI API...")
-    print("Access the web interface at: http://localhost:8000")
-    print("API documentation at: http://localhost:8000/docs")
-    
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
